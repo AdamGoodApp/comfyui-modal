@@ -232,3 +232,29 @@ def test_run_prompt_survives_unavailable_volume_reload(
     result = api.run_prompt(workflow={"17": {"class_type": "LoadImage", "inputs": {}}})
 
     assert result["prompt_id"] == "prompt-3"
+
+
+def test_get_volume_status_ignores_aborted_download_temp_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A download killed mid-flight leaves a .part-* file on the volume.
+
+    It must never be reported as a model: it would show up in the sidebar and
+    satisfy the auto-model presence check, masking a model that never landed.
+    """
+    comfyapp = _load_comfyapp(monkeypatch)
+
+    models_root = tmp_path / "models"
+    (models_root / "loras").mkdir(parents=True)
+    (models_root / "loras" / "real.safetensors").write_bytes(b"weights")
+    (models_root / "loras" / ".part-abc123").write_bytes(b"half-written")
+
+    monkeypatch.setattr(comfyapp, "MODELS_PATH", str(models_root))
+    monkeypatch.setattr(comfyapp, "CUSTOM_NODES_PATH", str(tmp_path / "nodes"))
+    monkeypatch.setattr(comfyapp, "vol", _RecordingVolume())
+    monkeypatch.setattr(comfyapp, "custom_nodes_vol", _RecordingVolume())
+
+    status = comfyapp.get_volume_status()
+
+    assert [m["name"] for m in status["models"]] == ["real.safetensors"]

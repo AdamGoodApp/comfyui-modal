@@ -19,7 +19,7 @@ from model_urls import (
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.1.0"
+COMFYAPP_VERSION = "2.1.1"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -138,6 +138,17 @@ def download_model_to_volume(url: str, filename: str = "", save_path: str = "che
 
         resolved = sanitize_filename(filename) if filename else ""
         dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Reclaim bytes from downloads killed mid-flight (e.g. function timeout).
+        # Age-gated well beyond this function's 1800s timeout so a sibling
+        # starmap container's in-flight temp file is never deleted.
+        stale_before = time.time() - 4 * 3600
+        for old in dest_dir.glob(".part-*"):
+            try:
+                if old.stat().st_mtime < stale_before:
+                    old.unlink()
+            except OSError:
+                pass
 
         if resolved:
             dest = dest_dir / resolved
@@ -302,6 +313,11 @@ def get_volume_status() -> dict:
             if not os.path.isdir(folder_path):
                 continue
             for fname in os.listdir(folder_path):
+                # Skip in-progress/aborted .part-* temp files and other dotfiles:
+                # a download killed mid-flight would otherwise be reported as a
+                # real model and pollute the sidebar and presence index.
+                if fname.startswith("."):
+                    continue
                 fpath = os.path.join(folder_path, fname)
                 if os.path.isfile(fpath):
                     models.append({"folder": folder, "name": fname, "size": os.path.getsize(fpath)})
@@ -563,6 +579,8 @@ class _ComfyAPIMixin:
                 continue
             files = []
             for fname in sorted(os.listdir(folder_path)):
+                if fname.startswith("."):
+                    continue
                 fpath = os.path.join(folder_path, fname)
                 if os.path.isfile(fpath):
                     files.append({"name": fname, "size": os.path.getsize(fpath), "folder": folder})
@@ -576,6 +594,8 @@ class _ComfyAPIMixin:
             if not os.path.isdir(folder_path):
                 continue
             for fname in sorted(os.listdir(folder_path)):
+                if fname.startswith("."):
+                    continue
                 fpath = os.path.join(folder_path, fname)
                 if os.path.isfile(fpath):
                     result["checkpoints"].append({"name": fname, "size": os.path.getsize(fpath), "folder": folder})
