@@ -11,11 +11,15 @@ if _NODE_DIR not in sys.path:
     sys.path.insert(0, _NODE_DIR)
 
 from workflow_inputs import stage_remote_input_images
+from model_urls import (
+    classify, hf_normalize, civitai_version_id, civitai_model_id,
+    filename_from_content_disposition, filename_from_url, sanitize_filename,
+)
 
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.0.2"
+COMFYAPP_VERSION = "2.1.0"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -26,6 +30,10 @@ MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 
 SUPPORTED_GPUS = ["a10g", "a100", "t4"]
+
+# Modal secret holding HF_TOKEN and CIVITAI_TOKEN (created in setup, see README)
+MODEL_TOKENS_SECRET = "comfyui-model-tokens"
+model_tokens_secret = modal.Secret.from_name(MODEL_TOKENS_SECRET)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -43,13 +51,13 @@ image = (
         "comfy --skip-prompt install --nvidia",
         gpu="a10g",
     )
-    .add_local_python_source("workflow_inputs")
+    .add_local_python_source("workflow_inputs", "model_urls")
 )
 
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("httpx>=0.27.0")
-    .add_local_python_source("workflow_inputs")
+    .add_local_python_source("workflow_inputs", "model_urls")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -80,36 +88,102 @@ def ui():
     memory=512,
     timeout=1800,
     volumes={MODELS_PATH: vol},
+    secrets=[model_tokens_secret],
 )
-def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = ""):
+def download_model_to_volume(url: str, filename: str = "", save_path: str = "checkpoints", hf_token: str = "") -> dict:
+    """Download one model into the volume.
+
+    Returns a dict and NEVER raises: batch_download_models iterates starmap
+    results, and a raised exception there aborts every remaining item.
+    Keys: status ("ok"|"error"), skipped, folder, filename, path, message.
+    """
     import httpx
+    import uuid as _uuid
     from pathlib import Path
 
-    dest = Path(MODELS_PATH) / save_path / filename
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    hf = hf_token or os.environ.get("HF_TOKEN", "")
+    civitai = os.environ.get("CIVITAI_TOKEN", "")
 
-    if dest.exists():
-        return {"status": "ok", "skipped": True, "path": str(dest)}
+    def _fail(msg: str) -> dict:
+        return {"status": "error", "skipped": False, "folder": save_path,
+                "filename": filename, "path": "", "message": msg[:500]}
 
-    headers = {}
-    if hf_token and "huggingface.co" in url:
-        headers["Authorization"] = f"Bearer {hf_token}"
+    dl_url = url
+    dest_dir = Path(MODELS_PATH) / save_path
+    tmp = dest_dir / f".part-{_uuid.uuid4().hex}"
+    try:
+        kind = classify(url)
+        headers = {}
+        if kind == "hf":
+            dl_url = hf_normalize(url)
+            if hf:
+                headers["Authorization"] = f"Bearer {hf}"
+        elif kind in ("civitai_download", "civitai_page"):
+            if civitai:
+                headers["Authorization"] = f"Bearer {civitai}"
+            if kind == "civitai_page":
+                version_id = civitai_version_id(url)
+                if not version_id:
+                    model_id = civitai_model_id(url)
+                    if not model_id:
+                        return _fail("Unrecognized civitai URL - use the model page URL or /api/download/models/<id>")
+                    r = httpx.get(f"https://civitai.com/api/v1/models/{model_id}",
+                                  headers=headers, timeout=60, follow_redirects=True)
+                    r.raise_for_status()
+                    versions = r.json().get("modelVersions", [])
+                    if not versions:
+                        return _fail("civitai model has no versions")
+                    version_id = str(versions[0]["id"])
+                dl_url = f"https://civitai.com/api/download/models/{version_id}"
 
-    with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=1800) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        with open(dest, "wb") as f:
-            for chunk in r.iter_bytes(chunk_size=1048576):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = downloaded / total * 100
-                    sys.stdout.write(f"\r  {pct:.1f}%  ({downloaded // 1024**2} MB / {total // 1024**2} MB)")
-                    sys.stdout.flush()
+        resolved = sanitize_filename(filename) if filename else ""
+        dest_dir.mkdir(parents=True, exist_ok=True)
 
-    vol.commit()
-    return {"status": "ok", "path": str(dest)}
+        if resolved:
+            dest = dest_dir / resolved
+            if dest.exists() and dest.stat().st_size > 0:
+                return {"status": "ok", "skipped": True, "folder": save_path,
+                        "filename": resolved, "path": str(dest), "message": ""}
+
+        with httpx.stream("GET", dl_url, headers=headers, follow_redirects=True, timeout=1800) as r:
+            r.raise_for_status()
+            if not resolved:
+                resolved = (filename_from_content_disposition(r.headers.get("content-disposition", ""))
+                            or filename_from_url(str(r.url))
+                            or filename_from_url(url))
+                if not resolved:
+                    return _fail("Could not determine a filename - set one explicitly")
+                dest = dest_dir / resolved
+                if dest.exists() and dest.stat().st_size > 0:
+                    return {"status": "ok", "skipped": True, "folder": save_path,
+                            "filename": resolved, "path": str(dest), "message": ""}
+            total = int(r.headers.get("content-length", 0))
+            downloaded = 0
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_bytes(chunk_size=1048576):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        pct = downloaded / total * 100
+                        sys.stdout.write(f"\r  {resolved}: {pct:.1f}% ({downloaded // 1024**2}/{total // 1024**2} MB)")
+                        sys.stdout.flush()
+
+        if tmp.stat().st_size == 0:
+            tmp.unlink()
+            return _fail("Downloaded 0 bytes - bad URL or auth required")
+        os.replace(tmp, dest)
+        vol.commit()
+        return {"status": "ok", "skipped": False, "folder": save_path,
+                "filename": resolved, "path": str(dest), "message": ""}
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        hint = " (auth failed - check Modal secret comfyui-model-tokens)" if code in (401, 403) else ""
+        return _fail(f"HTTP {code} for {dl_url}{hint}")
+    except Exception as e:
+        return _fail(str(e))
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
 
 @app.function(
@@ -122,14 +196,29 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
 def batch_download_models(items: list, hf_token: str = "") -> list:
     results = list(
         download_model_to_volume.starmap(
-            [(item["url"], item["filename"], item.get("save_path", "checkpoints"), hf_token) for item in items]
+            [(item["url"], item.get("filename", ""), item.get("save_path", "checkpoints"), hf_token) for item in items]
         )
     )
     return results
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=download_image,
+    cpu=1,
+    memory=512,
+    timeout=30,
+    secrets=[model_tokens_secret],
+)
+def get_token_status() -> dict:
+    """Report which auth tokens the deployed app can see (never the values)."""
+    return {
+        "hf": bool(os.environ.get("HF_TOKEN")),
+        "civitai": bool(os.environ.get("CIVITAI_TOKEN")),
+    }
+
+
+@app.function(
+    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("workflow_inputs", "model_urls"),
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -192,7 +281,7 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("workflow_inputs", "model_urls"),
     cpu=1,
     memory=512,
     timeout=60,
@@ -228,7 +317,7 @@ def get_volume_status() -> dict:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("workflow_inputs", "model_urls"),
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -250,7 +339,7 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=modal.Image.debian_slim(python_version="3.11").add_local_python_source("workflow_inputs", "model_urls"),
     cpu=2,
     memory=4096,
     timeout=3600,
@@ -351,6 +440,11 @@ class _ComfyAPIMixin:
         import urllib.request
         import urllib.error
         from pathlib import Path
+
+        try:
+            vol.reload()
+        except Exception as e:
+            print(f"[comfyui-modal] volume reload skipped: {e}")
 
         if input_images:
             stage_remote_input_images(

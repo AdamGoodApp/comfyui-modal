@@ -42,13 +42,28 @@ class _FakeVolumeHandle:
         return None
 
 
-class _FailingReloadVolume:
+class _RecordingVolume:
+    """Records reload calls so tests can assert the volume refresh happened."""
+
+    def __init__(self) -> None:
+        self.reloads = 0
+
     def commit(self) -> None:
         return None
 
     def reload(self) -> None:
-        msg = "run_prompt should not reload the models volume"
-        raise AssertionError(msg)
+        self.reloads += 1
+
+
+class _FailingReloadVolume:
+    """A volume whose reload always raises (open file handles on the volume)."""
+
+    def commit(self) -> None:
+        return None
+
+    def reload(self) -> None:
+        msg = "volume reload is unavailable"
+        raise RuntimeError(msg)
 
 
 class _FakeApp:
@@ -101,6 +116,9 @@ def _fake_modal_module() -> ModuleType:
     fake_modal.App = _FakeApp
     fake_modal.Volume = SimpleNamespace(
         from_name=lambda *_args, **_kwargs: _FakeVolumeHandle(),
+    )
+    fake_modal.Secret = SimpleNamespace(
+        from_name=lambda *_args, **_kwargs: object(),
     )
     fake_modal.web_server = lambda *_args, **_kwargs: (lambda value: value)
     fake_modal.method = lambda *_args, **_kwargs: (lambda value: value)
@@ -161,9 +179,15 @@ def test_run_prompt_stages_relative_input_paths(
     assert (remote_input_dir / "clipspace" / "mask.png").read_bytes() == b"mask-bytes"
 
 
-def test_run_prompt_submits_prompt_without_reloading_model_volume(
+def test_run_prompt_reloads_model_volume_so_warm_containers_see_new_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A warm container must pick up models downloaded after it started.
+
+    Containers only reload in @modal.enter, so without this refresh a run
+    queued right after an auto-model download fails validation on the model
+    the ensure step just fetched.
+    """
     comfyapp = _load_comfyapp(monkeypatch)
 
     class FakeAPI(comfyapp._ComfyAPIMixin):
@@ -173,10 +197,38 @@ def test_run_prompt_submits_prompt_without_reloading_model_volume(
     def fake_urlopen(_request: object) -> _FakeResponse:
         return _FakeResponse({"prompt_id": "prompt-2"})
 
-    monkeypatch.setattr(comfyapp, "vol", _FailingReloadVolume())
+    volume = _RecordingVolume()
+    monkeypatch.setattr(comfyapp, "vol", volume)
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
     api = FakeAPI()
     result = api.run_prompt(workflow={"17": {"class_type": "LoadImage", "inputs": {}}})
 
     assert result["prompt_id"] == "prompt-2"
+    assert volume.reloads == 1
+
+
+def test_run_prompt_survives_unavailable_volume_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused reload must degrade to a warning, never break the prompt.
+
+    An unguarded vol.reload() here previously aborted runs outright; the
+    refresh is best-effort because cold containers always load fresh state.
+    """
+    comfyapp = _load_comfyapp(monkeypatch)
+
+    class FakeAPI(comfyapp._ComfyAPIMixin):
+        def _poll_until_done(self, prompt_id: str, client_id: str) -> dict[str, str]:
+            return {"prompt_id": prompt_id, "client_id": client_id}
+
+    def fake_urlopen(_request: object) -> _FakeResponse:
+        return _FakeResponse({"prompt_id": "prompt-3"})
+
+    monkeypatch.setattr(comfyapp, "vol", _FailingReloadVolume())
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    api = FakeAPI()
+    result = api.run_prompt(workflow={"17": {"class_type": "LoadImage", "inputs": {}}})
+
+    assert result["prompt_id"] == "prompt-3"

@@ -1301,6 +1301,162 @@ function buildPanel() {
 
   scrollContent.appendChild(addSection);
 
+  // === AUTO MODELS SECTION ===
+  const autoSection = document.createElement("div");
+  autoSection.style.cssText = "display:flex; flex-direction:column; gap:8px; background:#1e1e2e; border-radius:6px; padding:10px;";
+
+  const autoTitle = document.createElement("div");
+  autoTitle.style.cssText = "font-weight:600; font-size:13px;";
+  autoTitle.textContent = "Auto Models";
+  autoSection.appendChild(autoTitle);
+
+  const autoHelp = document.createElement("div");
+  autoHelp.style.cssText = "font-size:11px; color:#888; line-height:1.4;";
+  autoHelp.textContent = "Wishlist synced to the Modal volume before every cloud run. One per line: folder url [filename]. Auth comes from Modal secret comfyui-model-tokens.";
+  autoSection.appendChild(autoHelp);
+
+  const tokenStatusEl = document.createElement("div");
+  tokenStatusEl.style.cssText = "font-size:11px; color:#888;";
+  tokenStatusEl.textContent = "Tokens: checking...";
+  autoSection.appendChild(tokenStatusEl);
+
+  async function refreshTokenStatus() {
+    try {
+      const r = await api.fetchApi(`${MODAL_PREFIX}/automodels/tokens`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      const mark = (ok) => (ok ? "\u2713" : "\u2717");
+      tokenStatusEl.textContent = `Tokens: HF ${mark(d.hf)}  Civitai ${mark(d.civitai)}`;
+      tokenStatusEl.style.color = d.hf && d.civitai ? "#7ed321" : "#f5a623";
+    } catch {
+      tokenStatusEl.textContent = "Tokens: unknown (deploy the app first)";
+    }
+  }
+
+  const autoInput = document.createElement("textarea");
+  autoInput.placeholder = "loras https://civitai.com/models/12345?modelVersionId=67890\ndiffusion_models https://huggingface.co/org/repo/resolve/main/model.safetensors";
+  autoInput.rows = 3;
+  autoInput.style.cssText = inputStyle() + "resize:vertical; font-family:monospace;";
+  autoSection.appendChild(autoInput);
+
+  const autoListEl = document.createElement("div");
+  autoListEl.style.cssText = "max-height:160px; overflow-y:auto; display:flex; flex-direction:column; gap:2px;";
+  autoSection.appendChild(autoListEl);
+
+  const autoStatusEl = document.createElement("div");
+  autoStatusEl.style.cssText = "font-size:11px; color:#888; min-height:14px;";
+  autoSection.appendChild(autoStatusEl);
+
+  function renderAutoEntries(entries) {
+    autoListEl.innerHTML = "";
+    for (const e of entries) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex; align-items:center; gap:6px; font-size:11px; padding:2px 0;";
+      const icon = document.createElement("span");
+      if (e.status === "present") { icon.textContent = "\u2713"; icon.style.color = "#7ed321"; }
+      else if (e.status === "error") { icon.textContent = "\u2717"; icon.style.color = "#e05050"; icon.title = e.error; }
+      else { icon.textContent = "\u23F3"; icon.style.color = "#f5a623"; }
+      const label = document.createElement("span");
+      label.style.cssText = "flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#ccc;";
+      label.textContent = `${e.folder}/${e.filename || e.url}`;
+      label.title = e.error ? `${e.url}\n${e.error}` : e.url;
+      const rm = document.createElement("button");
+      rm.textContent = "\u2715";
+      rm.style.cssText = "background:transparent; border:none; color:#888; cursor:pointer; font-size:11px;";
+      rm.onclick = async () => {
+        const r = await api.fetchApi(`${MODAL_PREFIX}/automodels/${e.id}`, { method: "DELETE" });
+        const d = await r.json();
+        renderAutoEntries(d.entries || []);
+      };
+      row.appendChild(icon);
+      row.appendChild(label);
+      row.appendChild(rm);
+      autoListEl.appendChild(row);
+    }
+  }
+
+  async function refreshAutoEntries() {
+    try {
+      const r = await api.fetchApi(`${MODAL_PREFIX}/automodels`);
+      const d = await r.json();
+      renderAutoEntries(d.entries || []);
+    } catch {}
+  }
+
+  const autoBtnRow = document.createElement("div");
+  autoBtnRow.style.cssText = "display:flex; gap:6px;";
+
+  const autoAddBtn = document.createElement("button");
+  autoAddBtn.textContent = "+ Add to Wishlist";
+  autoAddBtn.style.cssText = btnStyle() + "flex:1;";
+  autoAddBtn.onclick = async () => {
+    const lines = autoInput.value.split("\n").map((l) => l.trim()).filter(Boolean);
+    const items = [];
+    const bad = [];
+    for (const line of lines) {
+      const parts = line.split(/\s+/);
+      if (parts.length < 2 || !/^https?:\/\//i.test(parts[1])) { bad.push(line); continue; }
+      items.push({ folder: parts[0], url: parts[1], filename: parts[2] || "" });
+    }
+    if (bad.length) showToast(`Skipped ${bad.length} malformed line(s) - format: folder url [filename]`, "error");
+    if (!items.length) return;
+    try {
+      const r = await api.fetchApi(`${MODAL_PREFIX}/automodels`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items }),
+      });
+      const d = await r.json();
+      if (d.status !== "ok") throw new Error(d.message || "add failed");
+      if (d.rejected?.length) showToast(`Rejected: ${d.rejected.join("; ")}`, "error");
+      autoInput.value = "";
+      renderAutoEntries(d.entries || []);
+      showToast("Added - downloads on next cloud run or Sync Now", "success");
+    } catch (e) {
+      showToast("Error: " + e.message, "error");
+    }
+  };
+
+  const autoSyncBtn = document.createElement("button");
+  autoSyncBtn.textContent = "\u21BB Sync Now";
+  autoSyncBtn.style.cssText = btnStyle("primary") + "flex:1;";
+  autoSyncBtn.onclick = async () => {
+    autoSyncBtn.disabled = true;
+    autoStatusEl.textContent = "Syncing (large models can take minutes)...";
+    autoStatusEl.style.color = "#f5a623";
+    try {
+      const r = await api.fetchApi(`${MODAL_PREFIX}/automodels/sync`, { method: "POST" });
+      const d = await r.json();
+      if (d.status !== "ok") throw new Error(d.message || "sync failed");
+      autoStatusEl.style.color = d.failed ? "#e05050" : "#7ed321";
+      autoStatusEl.textContent = `${d.downloaded} downloaded, ${d.cached} cached, ${d.failed} failed`;
+      renderAutoEntries(d.entries || []);
+      await loadModels();
+    } catch (e) {
+      autoStatusEl.style.color = "#e05050";
+      autoStatusEl.textContent = "Error: " + e.message;
+    }
+    autoSyncBtn.disabled = false;
+  };
+
+  autoBtnRow.appendChild(autoAddBtn);
+  autoBtnRow.appendChild(autoSyncBtn);
+  autoSection.appendChild(autoBtnRow);
+
+  api.addEventListener("comfymodal_automodels", (ev) => {
+    const msg = ev?.detail?.message || "";
+    if (msg) {
+      autoStatusEl.textContent = msg;
+      autoStatusEl.style.color = "#f5a623";
+    }
+    refreshAutoEntries();
+  });
+
+  refreshTokenStatus();
+  refreshAutoEntries();
+
+  scrollContent.appendChild(autoSection);
+
   // === SETTINGS SECTION (Collapsible, at bottom) ===
   const settingsCollapsible = createCollapsibleSection("Settings", { defaultOpen: false, badge: null });
   settingsCollapsible.wrapper.querySelector("span:last-of-type").style.display = "none"; // hide badge for settings
@@ -1423,7 +1579,7 @@ function buildPanel() {
   };
 
   // === Modal sections toggle ===
-  const modalSectionElements = [gpuSection, syncCollapsible.wrapper, modelsCollapsible.wrapper, addSection];
+  const modalSectionElements = [gpuSection, syncCollapsible.wrapper, modelsCollapsible.wrapper, addSection, autoSection];
 
   function updateModalSections(enabled) {
     for (const el of modalSectionElements) {

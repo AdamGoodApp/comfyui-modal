@@ -6,3 +6,7 @@ __pycache__/
 .hf_token
 .custom_nodes.json
 .deploy_log
+auto_models.json
+auto_models.json.corrupt
+auto_models.json.tmp
+.venv/

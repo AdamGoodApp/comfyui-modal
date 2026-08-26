@@ -17,6 +17,7 @@ if _NODE_DIR not in sys.path:
     sys.path.insert(0, _NODE_DIR)
 
 from workflow_inputs import prepare_local_workflow_inputs
+import auto_models
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
@@ -222,7 +223,7 @@ except Exception as e:
 
 try:
     import modal as _modal_pkg
-    from modal_client import run_prompt, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, sync_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache
+    from modal_client import run_prompt, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, sync_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache, get_token_status
     _modal_available = True
     _maybe_auto_deploy()
 except ImportError:
@@ -244,6 +245,7 @@ except ImportError:
     def get_sync_status(*a, **kw): raise RuntimeError("modal not installed")
     def upload_model_to_volume(*a, **kw): raise RuntimeError("modal not installed")
     def upload_model_chunk(*a, **kw): raise RuntimeError("modal not installed")
+    def get_token_status(*a, **kw): raise RuntimeError("modal not installed")
     def set_gpu(gpu): pass
     def get_gpu(): return "a10g"
 
@@ -351,6 +353,17 @@ async def _execute_job(item: tuple, item_id: int):
     success = False
     outputs = {}
     try:
+        try:
+            await auto_models.ensure_pending(
+                get_sync_status,
+                batch_download_models,
+                _COMFYUI_ROOT,
+                notify=lambda m: _send(sid, "comfymodal_automodels", {"message": m, "prompt_id": prompt_id}),
+            )
+        except Exception as e:
+            print(f"[comfyui-modal] auto-models ensure failed: {e}")
+            _send(sid, "comfymodal_automodels", {"message": f"Auto-models failed: {e}", "prompt_id": prompt_id})
+
         prepared_inputs = prepare_local_workflow_inputs(
             workflow,
             Path(_COMFYUI_ROOT),
@@ -792,4 +805,39 @@ if _server:
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes")
+    @_server.routes.get("/comfymodal/automodels")
+    async def automodels_list(request: web.Request) -> web.Response:
+        return web.json_response({"entries": auto_models.load_entries()})
+
+    @_server.routes.post("/comfymodal/automodels")
+    async def automodels_add(request: web.Request) -> web.Response:
+        body = await request.json()
+        items = body.get("items", [])
+        if not items:
+            return web.json_response({"status": "error", "message": "items required"}, status=400)
+        entries, rejected = auto_models.add_entries(items)
+        return web.json_response({"status": "ok", "entries": entries, "rejected": rejected})
+
+    @_server.routes.delete("/comfymodal/automodels/{entry_id}")
+    async def automodels_remove(request: web.Request) -> web.Response:
+        entries = auto_models.remove_entry(request.match_info["entry_id"])
+        return web.json_response({"status": "ok", "entries": entries})
+
+    @_server.routes.post("/comfymodal/automodels/sync")
+    async def automodels_sync(request: web.Request) -> web.Response:
+        try:
+            summary = await auto_models.ensure_pending(
+                get_sync_status, batch_download_models, _COMFYUI_ROOT, force=True,
+            )
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=503)
+        return web.json_response({"status": "ok", **summary, "entries": auto_models.load_entries()})
+
+    @_server.routes.get("/comfymodal/automodels/tokens")
+    async def automodels_tokens(request: web.Request) -> web.Response:
+        try:
+            return web.json_response(await get_token_status())
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=503)
+
+    print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/automodels, /comfymodal/automodels/sync, /comfymodal/automodels/tokens")

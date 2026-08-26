@@ -13,6 +13,7 @@ _sync_custom_nodes_fn = modal.Function.from_name("comfyui", "sync_custom_nodes_t
 _get_volume_status_fn = modal.Function.from_name("comfyui", "get_volume_status")
 _upload_model_fn = modal.Function.from_name("comfyui", "upload_model_to_volume")
 _upload_model_chunk_fn = modal.Function.from_name("comfyui", "upload_model_chunk")
+_token_status_fn = modal.Function.from_name("comfyui", "get_token_status")
 
 _current_gpu = "a10g"
 _api_instances = {}
@@ -131,3 +132,8 @@ async def upload_model_chunk(chunk_data: bytes, folder: str, filename: str, offs
     return await asyncio.to_thread(
         lambda: _upload_model_chunk_fn.remote(chunk_data, folder, filename, offset, is_last),
     )
+
+
+@_modal_error_handler
+async def get_token_status() -> dict:
+    return await asyncio.to_thread(lambda: _token_status_fn.remote())

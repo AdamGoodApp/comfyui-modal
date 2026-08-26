@@ -98,6 +98,9 @@ def test_comfyapp_bootstraps_repo_path_before_importing_workflow_inputs() -> Non
     fake_modal.Volume = SimpleNamespace(
         from_name=lambda *_args, **_kwargs: SimpleNamespace(),
     )
+    fake_modal.Secret = SimpleNamespace(
+        from_name=lambda *_args, **_kwargs: object(),
+    )
     fake_modal.web_server = lambda *_args, **_kwargs: (lambda value: value)
     fake_modal.method = lambda *_args, **_kwargs: (lambda value: value)
     fake_modal.enter = lambda *_args, **_kwargs: (lambda value: value)
