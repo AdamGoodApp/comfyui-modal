@@ -138,6 +138,46 @@ Models are stored in a Modal Volume (`comfyui-models`), not locally.
 
 Toggle **Modal ON → Local** in the sidebar to bypass Modal and run generations on your local ComfyUI directly. Toggle back to resume cloud routing.
 
+### Auto Models (wishlist)
+
+Keep a list of model URLs; every cloud run downloads the ones missing from the
+Modal Volume, skips the ones already cached, and drops a zero-byte stub locally
+so the model still appears in ComfyUI's loader dropdowns. Nothing large is ever
+stored on the local disk.
+
+**One-time setup** — auth tokens live in a Modal secret, not on disk:
+
+```bash
+modal secret create comfyui-model-tokens HF_TOKEN=hf_xxx CIVITAI_TOKEN=xxx
+# update later with --force
+```
+
+Get tokens at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+(read scope) and [civitai.com/user/account](https://civitai.com/user/account) (API Keys).
+Public models download without either token; gated HF repos and most Civitai
+downloads need them. The sidebar shows `Tokens: HF ✓ Civitai ✓` once the
+deployed app can see them.
+
+**Adding models** — in the Auto Models box, one per line, `folder url [filename]`:
+
+```
+loras https://civitai.com/models/12345?modelVersionId=67890
+diffusion_models https://huggingface.co/org/repo/resolve/main/model.safetensors
+upscale_models https://github.com/org/repo/releases/download/v1/model.pth custom_name.pth
+```
+
+The filename is optional — it is resolved from the server response
+(`Content-Disposition`, else the URL) and written back to the entry. Civitai
+model-page URLs are resolved to their download URL automatically; HF `/blob/`
+links are rewritten to `/resolve/`.
+
+Downloads happen on the next queued cloud run, or immediately via **↻ Sync Now**.
+An entry that fails twice stops being retried automatically (so a bad URL cannot
+cost a Modal call on every queue) and is only retried by **Sync Now**.
+
+The wishlist is stored in `auto_models.json` beside the plugin and is
+gitignored — it never leaves your machine.
+
 ---
 
 ## Re-deploying
